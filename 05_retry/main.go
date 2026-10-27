@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"time"
 )
+
+const retryBudget = 30 * time.Second
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -25,6 +28,9 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), retryBudget)
+	defer cancel()
+	request = request.WithContext(ctx)
 	client := &http.Client{
 		Transport: &http.Transport{DisableKeepAlives: true},
 		Timeout:   5 * time.Second,
@@ -51,8 +57,20 @@ func run(args []string) error {
 		}
 		ceiling = min(2000, ceiling*2)
 		pause := retryDelay(retryAfter, ceiling)
+		deadline, _ := ctx.Deadline()
+		if pause >= time.Until(deadline) {
+			fmt.Printf("result failure attempts %d\n", attempt)
+			return errors.New("retry delay exceeds remaining time budget")
+		}
 		fmt.Printf("sleep_ms %d\n", pause.Milliseconds())
-		time.Sleep(pause)
+		timer := time.NewTimer(pause)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			fmt.Printf("result failure attempts %d\n", attempt)
+			return ctx.Err()
+		}
 	}
 	return nil
 }
@@ -66,14 +84,25 @@ func parseArgs(args []string) (*http.Request, int, error) {
 		return nil, 0, errors.New("usage: retry <url> [--method METHOD] [--max-attempts N] [--idempotency-key KEY]")
 	}
 	flags.SetOutput(io.Discard)
-	if err := flags.Parse(args[1:]); err != nil {
+	url := args[0]
+	flagArgs := args[1:]
+	if strings.HasPrefix(args[0], "-") {
+		url = ""
+		flagArgs = args
+	}
+	if err := flags.Parse(flagArgs); err != nil {
 		return nil, 0, err
 	}
-	request, err := http.NewRequest(strings.ToUpper(*method), args[0], nil)
+	if url == "" && flags.NArg() == 1 {
+		url = flags.Arg(0)
+	} else if flags.NArg() != 0 {
+		return nil, 0, errors.New("unexpected positional arguments; place flags before or after the URL")
+	}
+	request, err := http.NewRequest(*method, url, nil)
 	if err != nil {
 		return nil, 0, err
 	}
-	if request.URL.Scheme != "http" || *maxAttempts < 1 {
+	if request.URL.Scheme != "http" || request.URL.Host == "" || *maxAttempts < 1 {
 		return nil, 0, errors.New("expected an HTTP URL and a positive number of attempts")
 	}
 	if *key != "" {
@@ -83,7 +112,18 @@ func parseArgs(args []string) (*http.Request, int, error) {
 }
 
 func send(client *http.Client, request *http.Request) (int, string, error) {
-	response, err := client.Do(request)
+	attempt := request.Clone(request.Context())
+	if request.Body != nil && request.Body != http.NoBody {
+		if request.GetBody == nil {
+			return 0, "", errors.New("request body cannot be replayed: GetBody is required")
+		}
+		body, err := request.GetBody()
+		if err != nil {
+			return 0, "", err
+		}
+		attempt.Body = body
+	}
+	response, err := client.Do(attempt)
 	if err != nil {
 		return 0, "", err
 	}

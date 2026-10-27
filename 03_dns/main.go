@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -80,23 +81,35 @@ func run(args []string) error {
 		return errors.New("server address must be an IP address")
 	}
 	cache := make(map[cacheKey]cacheEntry)
-	var id uint16
+	var batchErr error
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		parts := strings.Fields(scanner.Text())
+		if len(parts) == 0 {
+			continue
+		}
 		if len(parts) != 2 {
-			return errors.New("expected: <name> <type>")
+			batchErr = errors.New("expected: <name> <type>")
+			fmt.Fprintln(os.Stderr, batchErr)
+			continue
 		}
 
 		name := parts[0]
 		queryType, ok := recordTypes[strings.ToUpper(parts[1])]
 		if !ok {
-			return fmt.Errorf("unsupported query type: %s", parts[1])
+			batchErr = fmt.Errorf("unsupported query type: %s", parts[1])
+			fmt.Fprintln(os.Stderr, batchErr)
+			continue
+		}
+		if _, err := encodeName(name); err != nil {
+			batchErr = err
+			fmt.Fprintln(os.Stderr, err)
+			continue
 		}
 
 		fmt.Printf("query %s %s\n", name, parts[1])
 		key := cacheKey{
-			name:       name,
+			name:       strings.ToLower(strings.TrimSuffix(name, ".")),
 			recordType: queryType,
 		}
 		if entry, ok := cache[key]; ok {
@@ -107,19 +120,35 @@ func run(args []string) error {
 			delete(cache, key)
 		}
 
-		id++
-		packet := buildQuery(name, queryType, id)
+		var randomID [2]byte
+		if _, err := rand.Read(randomID[:]); err != nil {
+			fmt.Print("status SERVFAIL\nend\n")
+			return err
+		}
+		id := binary.BigEndian.Uint16(randomID[:])
+		packet, err := buildQuery(name, queryType, id)
+		if err != nil {
+			fmt.Print("status FORMERR\nend\n")
+			return err
+		}
 		responseBytes, err := sendPacket(addr, packet, id)
 		if err != nil {
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				fmt.Print("status TIMEOUT\nend\n")
+				return err
 			}
-			return err
+			fmt.Print("status SERVFAIL\nend\n")
+			batchErr = err
+			fmt.Fprintln(os.Stderr, err)
+			continue
 		}
 		response, err := parseResponse(responseBytes)
 		if err != nil {
-			return err
+			fmt.Print("status FORMERR\nend\n")
+			batchErr = err
+			fmt.Fprintln(os.Stderr, err)
+			continue
 		}
 		if response.rcode == 0 && response.answerCount > 0 && response.minTTL > 0 {
 			cache[key] = cacheEntry{
@@ -129,31 +158,45 @@ func run(args []string) error {
 		}
 		printResponse(response)
 	}
-	return scanner.Err()
+	return errors.Join(batchErr, scanner.Err())
 }
 
-func buildQuery(name string, queryType, id uint16) []byte {
+func buildQuery(name string, queryType, id uint16) ([]byte, error) {
+	encoded, err := encodeName(name)
+	if err != nil {
+		return nil, err
+	}
 	var header [dnsHeaderSize]byte
 
 	binary.BigEndian.PutUint16(header[0:2], id)
 	binary.BigEndian.PutUint16(header[2:4], 0x0100)
 	binary.BigEndian.PutUint16(header[4:6], 1)
 
-	packet := append(header[:], encodeName(name)...)
-	return append(packet, byte(queryType>>8), byte(queryType), 0, 1)
+	packet := append(header[:], encoded...)
+	return append(packet, byte(queryType>>8), byte(queryType), 0, 1), nil
 }
 
-func encodeName(name string) []byte {
+func encodeName(name string) ([]byte, error) {
+	if name == "." {
+		return []byte{0}, nil
+	}
+	name = strings.TrimSuffix(name, ".")
 	parts := strings.Split(name, ".")
 
 	result := make([]byte, 0, len(parts)*2)
 	for _, part := range parts {
+		if len(part) == 0 || len(part) > 63 {
+			return nil, errors.New("DNS: label must contain 1 to 63 bytes")
+		}
 		result = append(result, byte(len(part)))
 		result = append(result, part...)
 	}
 	result = append(result, 0)
 
-	return result
+	if len(result) > 255 {
+		return nil, errors.New("DNS: name exceeds 255 bytes")
+	}
+	return result, nil
 }
 
 func sendPacket(addr string, packet []byte, id uint16) ([]byte, error) {
@@ -242,6 +285,9 @@ func readAnswer(message []byte, offset int) (dnsAnswer, int, error) {
 	header := message[start : start+dnsRecordHeaderSize]
 	recordType := binary.BigEndian.Uint16(header[:dnsUint16Size])
 	ttl := binary.BigEndian.Uint32(header[ttlOffset:dataLengthOffset])
+	if ttl&0x80000000 != 0 {
+		ttl = 0
+	}
 	length := int(binary.BigEndian.Uint16(header[dataLengthOffset:]))
 	start += dnsRecordHeaderSize
 	end := start + length
@@ -261,9 +307,15 @@ func parseAnswer(message []byte, start, end int, recordType uint16) (dnsAnswer, 
 
 	switch recordType {
 	case dnsTypeA:
+		if len(data) != net.IPv4len {
+			return answer, errors.New("DNS: invalid A length")
+		}
 		answer.recordType = "A"
 		answer.value = net.IP(data).String()
 	case dnsTypeAAAA:
+		if len(data) != net.IPv6len {
+			return answer, errors.New("DNS: invalid AAAA length")
+		}
 		answer.recordType = "AAAA"
 		answer.value = net.IP(data).String()
 	case dnsTypeNS, dnsTypeCNAME:
@@ -271,14 +323,14 @@ func parseAnswer(message []byte, start, end int, recordType uint16) (dnsAnswer, 
 		if recordType == dnsTypeCNAME {
 			answer.recordType = "CNAME"
 		}
-		answer.value, _, err = readName(message, start)
+		answer.value, err = readRecordName(message, start, end)
 	case dnsTypeMX:
 		if len(data) < dnsUint16Size {
 			return answer, errors.New("truncated MX priority")
 		}
 		answer.recordType = "MX"
 		priority := binary.BigEndian.Uint16(data[:dnsUint16Size])
-		name, _, nameErr := readName(message, start+dnsUint16Size)
+		name, nameErr := readRecordName(message, start+dnsUint16Size, end)
 		answer.value = fmt.Sprintf("%d %s", priority, name)
 		err = nameErr
 	case dnsTypeTXT:
@@ -286,6 +338,14 @@ func parseAnswer(message []byte, start, end int, recordType uint16) (dnsAnswer, 
 		answer.value, err = readText(data)
 	}
 	return answer, err
+}
+
+func readRecordName(message []byte, start, end int) (string, error) {
+	name, next, err := readName(message, start)
+	if err == nil && next > end {
+		err = errors.New("DNS: name exceeds record data")
+	}
+	return name, err
 }
 
 func readText(data []byte) (string, error) {
@@ -296,7 +356,13 @@ func readText(data []byte) (string, error) {
 		if length > len(data) {
 			return "", errors.New("truncated TXT string")
 		}
-		text.Write(data[:length])
+		for _, b := range data[:length] {
+			if b < 0x20 || b > 0x7e || b == '\\' {
+				fmt.Fprintf(&text, "\\x%02x", b)
+			} else {
+				text.WriteByte(b)
+			}
+		}
 		data = data[length:]
 	}
 	return text.String(), nil
@@ -316,13 +382,23 @@ func readLabels(message []byte, offset int) ([]string, int, error) {
 		pointerOffsetMask = 0x3FFF
 	)
 	var labels []string
+	visited := make(map[int]bool)
+	next := -1
+	nameLength := 1
 	for {
 		if offset < 0 || offset >= len(message) {
 			return nil, 0, errors.New("DNS: name outside packet")
 		}
+		if visited[offset] {
+			return nil, 0, errors.New("DNS: compression pointer loop")
+		}
+		visited[offset] = true
 		length := int(message[offset])
 		if length == 0 {
-			return labels, offset + 1, nil
+			if next < 0 {
+				next = offset + 1
+			}
+			return labels, next, nil
 		}
 		if length&pointerPrefix == pointerPrefix {
 			end := offset + dnsUint16Size
@@ -330,8 +406,18 @@ func readLabels(message []byte, offset int) ([]string, int, error) {
 				return nil, 0, errors.New("DNS: truncated pointer")
 			}
 			target := int(binary.BigEndian.Uint16(message[offset:end]) & pointerOffsetMask)
-			tail, _, err := readLabels(message, target)
-			return append(labels, tail...), end, err
+			if next < 0 {
+				next = end
+			}
+			offset = target
+			continue
+		}
+		if length&pointerPrefix != 0 {
+			return nil, 0, errors.New("DNS: reserved label prefix")
+		}
+		nameLength += length + 1
+		if nameLength > 255 {
+			return nil, 0, errors.New("DNS: name exceeds 255 bytes")
 		}
 
 		offset++
@@ -344,10 +430,12 @@ func readLabels(message []byte, offset int) ([]string, int, error) {
 	}
 }
 
+var statusNames = map[uint16]string{
+	0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 5: "REFUSED",
+}
+
 func statusName(responseCode uint16) string {
-	if name, ok := map[uint16]string{
-		0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 5: "REFUSED",
-	}[responseCode]; ok {
+	if name, ok := statusNames[responseCode]; ok {
 		return name
 	}
 	return fmt.Sprintf("RCODE%d", responseCode)

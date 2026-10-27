@@ -59,6 +59,9 @@ func parseMessage(data []byte) (message, error) {
 	}
 
 	contentLength := 0
+	lengthText := ""
+	lengthOverflow := false
+	var encodings []string
 	chunked := false
 	for {
 		line, rest, ok = readLine(rest)
@@ -77,17 +80,40 @@ func parseMessage(data []byte) (message, error) {
 			if !isnum(field.value) {
 				return msg, errHeader
 			}
-			length, err := strconv.Atoi(field.value)
-			if err != nil {
+			canonical := strings.TrimLeft(field.value, "0")
+			if canonical == "" {
+				canonical = "0"
+			}
+			if lengthText != "" && lengthText != canonical {
 				return msg, errHeader
 			}
+			lengthText = canonical
+			length, err := strconv.Atoi(canonical)
+			lengthOverflow = err != nil
 			contentLength = length
 		case "transfer-encoding":
-			chunked = chunked || strings.EqualFold(field.value, "chunked")
+			for _, coding := range strings.Split(field.value, ",") {
+				coding = strings.ToLower(strings.TrimSpace(coding))
+				if !token(coding) {
+					return msg, errHeader
+				}
+				encodings = append(encodings, coding)
+			}
 		}
 		msg.headers = append(msg.headers, field)
 	}
 
+	for i, coding := range encodings {
+		if coding == "chunked" {
+			if i != len(encodings)-1 {
+				return msg, errHeader
+			}
+			chunked = true
+		}
+	}
+	if len(encodings) > 0 && !chunked && msg.method != "" {
+		return msg, errHeader
+	}
 	if chunked {
 		body, err := parseChunks(rest)
 		if err != nil {
@@ -95,7 +121,7 @@ func parseMessage(data []byte) (message, error) {
 		}
 		msg.body = body
 	} else {
-		if len(rest) < contentLength {
+		if lengthOverflow || len(rest) < contentLength {
 			return msg, errBody
 		}
 		msg.body = rest[:contentLength]
@@ -104,6 +130,9 @@ func parseMessage(data []byte) (message, error) {
 }
 
 func parseStartLine(line string, msg *message) error {
+	if hasControl(line, false) {
+		return errStartLine
+	}
 	parts := strings.SplitN(line, " ", 3)
 	if len(parts) != 3 {
 		return errStartLine
@@ -124,7 +153,7 @@ func parseStartLine(line string, msg *message) error {
 
 func parseHeader(line string) (header, error) {
 	name, value, ok := strings.Cut(line, ":")
-	if !ok || !token(name) {
+	if !ok || !token(name) || hasControl(value, true) {
 		return header{}, errHeader
 	}
 	return header{strings.ToLower(name), strings.Trim(value, " \t")}, nil
@@ -138,6 +167,7 @@ func parseChunks(data []byte) ([]byte, error) {
 			return nil, errChunk
 		}
 		sizeText, _, _ := strings.Cut(string(line), ";")
+		sizeText = strings.TrimRight(sizeText, " \t")
 		size, err := strconv.ParseUint(sizeText, 16, 64)
 		if err != nil {
 			return nil, errChunk
@@ -179,6 +209,15 @@ func token(text string) bool {
 
 func isnum(text string) bool {
 	return text != "" && strings.Trim(text, "0123456789") == ""
+}
+
+func hasControl(text string, allowTab bool) bool {
+	for i := 0; i < len(text); i++ {
+		if (text[i] < 0x20 && !(allowTab && text[i] == '\t')) || text[i] == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func printMessage(msg message) {

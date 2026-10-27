@@ -12,10 +12,11 @@ import (
 )
 
 type frame struct {
-	ethernet      []byte
-	ip            []byte
-	transport     []byte
-	payloadLength int
+	ethernet       []byte
+	ip             []byte
+	transport      []byte
+	printTransport func([]byte)
+	payloadLength  int
 }
 
 func main() {
@@ -36,11 +37,7 @@ func run() error {
 		return fmt.Errorf("hex input: %w", err)
 	}
 	packet, err := parseFrame(data)
-	if err != nil {
-		return err
-	}
-	printFrame(packet)
-	return nil
+	return printFrame(packet, err)
 }
 
 func parseFrame(data []byte) (frame, error) {
@@ -57,10 +54,13 @@ func parseFrame(data []byte) (frame, error) {
 	if len(data) < 20 {
 		return packet, errors.New("IPv4: invalid header")
 	}
+	if data[0]>>4 != 4 {
+		return packet, errors.New("IPv4: invalid version ip")
+	}
 	headerLength := int(data[0]&0x0F) * 4
 	totalLength := int(binary.BigEndian.Uint16(data[2:4]))
 	if headerLength < 20 || totalLength < headerLength || totalLength > len(data) {
-		return packet, errors.New("IPv4: invalid length")
+		return packet, errors.New("IPv4: invalid headerLength")
 	}
 	packet.ip = data[:headerLength]
 	data = data[headerLength:totalLength]
@@ -76,21 +76,24 @@ func parseFrame(data []byte) (frame, error) {
 		}
 		headerLength = int(data[12]>>4) * 4
 		if headerLength < 20 || headerLength > len(data) {
-			return packet, errors.New("TCP: invalid header length")
+			return packet, errors.New("TCP: invalid header headerLength")
 		}
 		packet.transport = data[:headerLength]
+		packet.printTransport = printTCP
 		packet.payloadLength = len(data) - headerLength
 	case 17:
 		if len(data) < 8 {
 			return packet, errors.New("UDP: truncated header")
 		}
-		length := int(binary.BigEndian.Uint16(data[4:6]))
-		if length < 8 {
-			return packet, errors.New("UDP: invalid length")
+		headerLength = int(binary.BigEndian.Uint16(data[4:6]))
+		if headerLength < 8 || headerLength > len(data) && binary.BigEndian.Uint16(packet.ip[6:8])&0x2000 == 0 {
+			return packet, errors.New("UDP: invalid headerLength")
 		}
 		packet.transport = data[:8]
-		packet.payloadLength = min(length, len(data)) - 8
+		packet.printTransport = printUDP
+		packet.payloadLength = min(headerLength, len(data)) - 8
 	}
+
 	return packet, nil
 }
 
@@ -105,24 +108,31 @@ func checksumValid(header []byte) bool {
 	return sum == 0xFFFF
 }
 
-func printFrame(packet frame) {
+func printFrame(packet frame, err error) error {
 	eth := packet.ethernet
+	if eth == nil {
+		return err
+	}
+	printEth(eth)
+
+	if packet.ip == nil {
+		return err
+	}
+	printIPv4(packet.ip)
+
+	if packet.transport != nil {
+		packet.printTransport(packet.transport)
+	}
+
+	fmt.Println("payload.length", packet.payloadLength)
+
+	return err
+}
+
+func printEth(eth []byte) {
 	fmt.Println("eth.dst", net.HardwareAddr(eth[:6]))
 	fmt.Println("eth.src", net.HardwareAddr(eth[6:12]))
 	fmt.Printf("eth.ethertype 0x%04x\n", binary.BigEndian.Uint16(eth[12:14]))
-	if packet.ip == nil {
-		return
-	}
-	printIPv4(packet.ip)
-	if packet.transport != nil {
-		switch packet.ip[9] {
-		case 6:
-			printTCP(packet.transport)
-		case 17:
-			printUDP(packet.transport)
-		}
-	}
-	fmt.Println("payload.length", packet.payloadLength)
 }
 
 func printIPv4(ip []byte) {
